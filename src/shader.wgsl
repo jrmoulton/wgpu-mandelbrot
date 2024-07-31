@@ -1,8 +1,10 @@
 
 // Define uniform buffer structure
 struct Uniforms {
-    scale: f32,
-    offset: vec2<f32>,
+    scale_low: f32,
+    scale_high: f32,
+    offset_low: vec2<f32>,
+    offset_high: vec2<f32>,
     viewport_size: vec2<f32>,
 };
 
@@ -19,17 +21,17 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.pos = vec4<f32>(in.pos, 0.0, 1.0);
+
     switch (in.index) {
         case 0u,3u: {
             out.uv = vec2<f32>(0.0, 1.0); // Bottom-left
             break;
         }
-        case 1u {
+        case 1u: {
             out.uv = vec2<f32>(1.0, 1.0); // Bottom-right
             break;
         }
@@ -41,16 +43,27 @@ fn vs_main(in: VertexInput) -> VertexOutput {
             out.uv = vec2<f32>(0.0, 0.0); // Top-left
             break;
         }
-        default {
+        default: {
             out.uv = vec2<f32>(0.0, 0.0); // Default case
         }
     }
+
+    // Calculate aspect ratio
+    let aspect_ratio = uniforms.viewport_size.x / uniforms.viewport_size.y;
 
 
     // Adjust UV coordinates based on the uniform scale and offset
     out.uv = out.uv / uniforms.scale - uniforms.offset / uniforms.scale / uniforms.viewport_size;
     out.uv = vec2<f32>(out.uv.x * 3.5 - 2.5, out.uv.y * 2.0 - 1.0);
 
+    out.uv = vec2<f32>(out.uv.x * aspect_ratio / 2.0, out.uv.y);
+    // // Adjust UV coordinates based on the aspect ratio to fill the entire viewport
+    // if (aspect_ratio > 1.0) {
+    //     // Width > Height, scale UVs horizontally
+    // } else {
+    //     // Height > Width, scale UVs vertically
+    //     out.uv = vec2<f32>(out.uv.x, out.uv.y / aspect_ratio);
+    // }
 
     return out;
 }
