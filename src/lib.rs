@@ -15,27 +15,30 @@ use winit::{
     keyboard::NamedKey,
     window::{Window, WindowId},
 };
-
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct Uniforms {
-    scale: f32,
-    _pad: f32,
-    offset: [f32; 2],
+pub struct Globals {
+    transform: [f32; 8], // Already padded to satisfy alignment
     viewport_size: [f32; 2],
+    _padding: [f32; 2], // Padding to ensure 16-byte alignment
+}
+fn transform_from_affine(affine: Affine) -> [f32; 8] {
+    let [a, b, c, d, e, f] = affine.as_coeffs();
+    [
+        a as f32, b as f32, c as f32, d as f32, e as f32, f as f32, 0., 0.,
+    ]
 }
 
-impl Uniforms {
+impl Globals {
     fn new() -> Self {
         Self {
-            scale: 1.0,
-            offset: [0.0, 0.0],
+            transform: transform_from_affine(Affine::IDENTITY),
             viewport_size: [800.0, 600.0],
-            _pad: 0.0,
+            _padding: [0.0, 0.0],
         }
     }
 
-    fn create_uniform_buffer(
+    fn create_globals_u_buffer(
         device: &Device,
     ) -> (wgpu::Buffer, wgpu::BindGroupLayout, wgpu::BindGroup) {
         let new = Self::new();
@@ -60,12 +63,12 @@ impl Uniforms {
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Uniform Bind Group"),
             layout: &bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
             }],
-            label: Some("Uniform Bind Group"),
         });
 
         (uniform_buffer, bind_group_layout, bind_group)
@@ -109,8 +112,8 @@ struct WindowState {
     config: SurfaceConfiguration,
     pipeline: RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    uniform_buffer: wgpu::Buffer,
-    uniform_bind_group: BindGroup,
+    globals_buffer: wgpu::Buffer,
+    globals_bind_group: BindGroup,
     num_vertices: u32,
     mouse_down: bool,
     transform: Affine,
@@ -118,16 +121,70 @@ struct WindowState {
 }
 
 impl WindowState {
-    fn update_uniforms(&self) {
-        let translation = self.transform.translation();
-        let uniforms = Uniforms {
-            scale: self.transform.as_coeffs()[0] as f32,
-            offset: [translation.x as f32, translation.y as f32],
-            _pad: 0.0,
+    fn new(
+        window: Arc<Window>,
+        adapter: wgpu::Adapter,
+        device: Device,
+        queue: Queue,
+        surface: Surface<'static>,
+    ) -> Self {
+        let size = window.inner_size();
+        let surface_caps = surface.get_capabilities(&adapter);
+        let texture_format = surface_caps
+            .formats
+            .into_iter()
+            .find(|it| matches!(it, TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm))
+            .unwrap();
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: texture_format,
+            width: size.width,
+            height: size.height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: wgpu::CompositeAlphaMode::PostMultiplied,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let (globals_u_buffer, globals_u_group_layout, globals_group) =
+            Globals::create_globals_u_buffer(&device);
+        let pipeline = App::pipeline(&device, texture_format, &globals_u_group_layout);
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(VERTICES),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let num_vertices = VERTICES.len() as u32;
+
+        Self {
+            window,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
+            surface,
+            config,
+            pipeline,
+            vertex_buffer,
+            num_vertices,
+            globals_buffer: globals_u_buffer,
+            globals_bind_group: globals_group,
+            mouse_down: false,
+            prior_mouse_pos: None,
+            transform: Affine::IDENTITY,
+        }
+    }
+
+    fn update_globals(&self) {
+        let uniforms = Globals {
+            transform: transform_from_affine(self.transform.inverse()),
             viewport_size: [self.config.width as f32, self.config.height as f32],
+            _padding: [0.0, 0.0],
         };
         self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.window.request_redraw();
     }
 
@@ -135,7 +192,7 @@ impl WindowState {
         self.config.width = size.width;
         self.config.height = size.height;
         self.surface.configure(&self.device, &self.config);
-        self.update_uniforms();
+        self.update_globals();
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -148,13 +205,19 @@ impl WindowState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         {
+            let clear_color = wgpu::Color {
+                r: 0.1,
+                g: 0.2,
+                b: 0.3,
+                a: 0.0,
+            };
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -162,7 +225,7 @@ impl WindowState {
                 ..Default::default()
             });
             render_pass.set_pipeline(&self.pipeline); // 2.
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
             render_pass.draw(0..self.num_vertices, 0..1); // 3.
         }
@@ -236,69 +299,13 @@ impl App {
             cache: None,     // 6.
         })
     }
-
-    fn setup_window_state(
-        window: Arc<Window>,
-        adapter: wgpu::Adapter,
-        device: Device,
-        queue: Queue,
-        surface: Surface<'static>,
-    ) -> WindowState {
-        let size = window.inner_size();
-        let surface_caps = surface.get_capabilities(&adapter);
-        let texture_format = surface_caps
-            .formats
-            .into_iter()
-            .find(|it| matches!(it, TextureFormat::Rgba8Unorm | TextureFormat::Bgra8Unorm))
-            .unwrap();
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: texture_format,
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let (uniform_buffer, uniform_group_layout, uniform_group) =
-            Uniforms::create_uniform_buffer(&device);
-        let pipeline = App::pipeline(&device, texture_format, &uniform_group_layout);
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(VERTICES),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let num_vertices = VERTICES.len() as u32;
-
-        WindowState {
-            window,
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            surface,
-            config,
-            pipeline,
-            vertex_buffer,
-            num_vertices,
-            uniform_buffer,
-            uniform_bind_group: uniform_group,
-            mouse_down: false,
-            prior_mouse_pos: None,
-            transform: Affine::IDENTITY,
-        }
-    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window_state.is_none() {
             let window = event_loop
-                .create_window(Window::default_attributes())
+                .create_window(Window::default_attributes().with_transparent(true))
                 .unwrap();
 
             #[cfg(target_arch = "wasm32")]
@@ -364,13 +371,8 @@ impl ApplicationHandler for App {
                 wasm_bindgen_futures::spawn_local(async move {
                     let (adapter, device, queue, surface) = setup_future.await;
 
-                    let window_state = App::setup_window_state(
-                        window_clone.clone(),
-                        adapter,
-                        device,
-                        queue,
-                        surface,
-                    );
+                    let window_state =
+                        WindowState::new(window_clone.clone(), adapter, device, queue, surface);
 
                     unsafe {
                         (*app_ptr).window_state = Some(window_state);
@@ -385,7 +387,7 @@ impl ApplicationHandler for App {
                 let (adapter, device, queue, surface) = pollster::block_on(setup_future);
 
                 let window_state =
-                    App::setup_window_state(window.clone(), adapter, device, queue, surface);
+                    WindowState::new(window.clone(), adapter, device, queue, surface);
 
                 self.window_state = Some(window_state);
 
@@ -443,7 +445,7 @@ impl ApplicationHandler for App {
                             * Affine::scale(BASE.powf(exponent))
                             * Affine::translate(-prior_position)
                             * window_state.transform;
-                        window_state.update_uniforms();
+                        window_state.update_globals();
                     }
                 }
             }
@@ -460,7 +462,7 @@ impl ApplicationHandler for App {
                         if let Some(prior) = window_state.prior_mouse_pos {
                             window_state.transform =
                                 Affine::translate(position - prior) * window_state.transform;
-                            window_state.update_uniforms();
+                            window_state.update_globals();
                         }
                     }
                     window_state.prior_mouse_pos = Some(position);
@@ -470,7 +472,7 @@ impl ApplicationHandler for App {
                 if let Some(window_state) = &mut self.window_state {
                     if let winit::keyboard::Key::Named(NamedKey::Space) = event.logical_key {
                         window_state.transform = Affine::IDENTITY;
-                        window_state.update_uniforms();
+                        window_state.update_globals();
                     }
                 }
             }
