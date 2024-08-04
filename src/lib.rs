@@ -146,7 +146,10 @@ impl WindowState {
             width: size.width,
             height: size.height,
             present_mode: wgpu::PresentMode::Fifo,
+            #[cfg(target_os = "macos")]
             alpha_mode: wgpu::CompositeAlphaMode::PostMultiplied,
+            #[cfg(not(target_os = "macos"))]
+            alpha_mode: wgpu::CompositeAlphaMode::Auto,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
