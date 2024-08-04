@@ -1,7 +1,10 @@
+pub mod transforms;
+
+use transforms::{adjust_transform, aspect_ratio_correction};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
-use std::sync::Arc;
+use std::{f64::consts::TAU, sync::Arc};
 
 use kurbo::{Affine, Vec2};
 use wgpu::{
@@ -18,23 +21,24 @@ use winit::{
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Globals {
-    transform: [f32; 8], // Already padded to satisfy alignment
-    viewport_size: [f32; 2],
+    transform: [f32; 6],
     _padding: [f32; 2], // Padding to ensure 16-byte alignment
+    viewport_size: [f32; 2],
+    _padding2: [f32; 2], // Padding to ensure 16-byte alignment
 }
-fn transform_from_affine(affine: Affine) -> [f32; 8] {
+fn transform_from_affine(affine: Affine) -> [f32; 6] {
     let [a, b, c, d, e, f] = affine.as_coeffs();
-    [
-        a as f32, b as f32, c as f32, d as f32, e as f32, f as f32, 0., 0.,
-    ]
+    [a as f32, b as f32, c as f32, d as f32, e as f32, f as f32]
 }
+// Function to transform a point using the Affine struct
 
 impl Globals {
     fn new() -> Self {
         Self {
             transform: transform_from_affine(Affine::IDENTITY),
-            viewport_size: [800.0, 600.0],
             _padding: [0.0, 0.0],
+            viewport_size: [600., 800.],
+            _padding2: [0.0, 0.0],
         }
     }
 
@@ -178,10 +182,37 @@ impl WindowState {
     }
 
     fn update_globals(&self) {
+        // define the viewport
+        let viewport = Vec2::new(self.config.width as f64, self.config.height as f64);
+
+        let mandelbrot_min = Vec2::new(-2.0, -1.0);
+        let mandelbrot_max = Vec2::new(1.0, 1.0);
+        let adjusted_transform = adjust_transform(
+            self.transform.inverse(),
+            Vec2::new(0., 0.),
+            viewport,
+            mandelbrot_min,
+            mandelbrot_max,
+        );
+
+        // Calculate the aspect ratio of the Mandelbrot space
+        let mandelbrot_aspect_ratio =
+            (mandelbrot_max.x - mandelbrot_min.x) / (mandelbrot_max.y - mandelbrot_min.y);
+
+        // Compute the aspect ratio correction
+        let aspect_ratio_correction = aspect_ratio_correction(
+            viewport.x / viewport.y, // Aspect ratio of the viewport
+            mandelbrot_aspect_ratio, // Aspect ratio of the Mandelbrot space
+        )
+        .inverse();
+
+        let final_transform = aspect_ratio_correction * adjusted_transform;
+
         let uniforms = Globals {
-            transform: transform_from_affine(self.transform.inverse()),
-            viewport_size: [self.config.width as f32, self.config.height as f32],
+            transform: transform_from_affine(final_transform),
             _padding: [0.0, 0.0],
+            viewport_size: [viewport.x as f32, viewport.y as f32],
+            _padding2: [0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.globals_buffer, 0, bytemuck::cast_slice(&[uniforms]));
@@ -421,6 +452,52 @@ impl ApplicationHandler for App {
                     window_state.resize(size);
                 }
             }
+
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(_window_state) = &mut self.window_state {
+                    // window_state.mouse_down = false;
+                    // window_state.prior_mouse_pos = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(window_state) = &mut self.window_state {
+                    let position = Vec2::new(position.x, position.y);
+                    if window_state.mouse_down {
+                        if let Some(prior) = window_state.prior_mouse_pos {
+                            window_state.transform =
+                                Affine::translate(position - prior) * window_state.transform;
+                            window_state.update_globals();
+                        }
+                    }
+                    window_state.prior_mouse_pos = Some(position);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let Some(window_state) = &mut self.window_state {
+                    if matches!(event.state, ElementState::Pressed) {
+                        match event.logical_key {
+                            winit::keyboard::Key::Named(NamedKey::Space) => {
+                                window_state.transform = Affine::IDENTITY;
+                                window_state.update_globals();
+                            }
+                            winit::keyboard::Key::Named(
+                                NamedKey::ArrowRight | NamedKey::ArrowLeft,
+                            ) => {
+                                if let Some(prior_position) = window_state.prior_mouse_pos {
+                                    let is_clockwise = event.logical_key == NamedKey::ArrowLeft;
+                                    let angle = if is_clockwise { -0.1 * TAU } else { 0.1 * TAU };
+                                    window_state.transform = Affine::translate(prior_position)
+                                        * Affine::rotate(angle)
+                                        * Affine::translate(-prior_position)
+                                        * window_state.transform;
+                                    window_state.update_globals();
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                }
+            }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(window_state) = &mut self.window_state {
                     if button == MouseButton::Left {
@@ -445,33 +522,6 @@ impl ApplicationHandler for App {
                             * Affine::scale(BASE.powf(exponent))
                             * Affine::translate(-prior_position)
                             * window_state.transform;
-                        window_state.update_globals();
-                    }
-                }
-            }
-            WindowEvent::CursorLeft { .. } => {
-                if let Some(window_state) = &mut self.window_state {
-                    window_state.mouse_down = false;
-                    window_state.prior_mouse_pos = None;
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(window_state) = &mut self.window_state {
-                    let position = Vec2::new(position.x, position.y);
-                    if window_state.mouse_down {
-                        if let Some(prior) = window_state.prior_mouse_pos {
-                            window_state.transform =
-                                Affine::translate(position - prior) * window_state.transform;
-                            window_state.update_globals();
-                        }
-                    }
-                    window_state.prior_mouse_pos = Some(position);
-                }
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(window_state) = &mut self.window_state {
-                    if let winit::keyboard::Key::Named(NamedKey::Space) = event.logical_key {
-                        window_state.transform = Affine::IDENTITY;
                         window_state.update_globals();
                     }
                 }
