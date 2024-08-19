@@ -1,6 +1,6 @@
 pub mod transforms;
 
-use transforms::{adjust_transform, aspect_ratio_correction};
+use transforms::{aspect_ratio_correction, general_transform};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
@@ -98,6 +98,7 @@ impl Vertex {
     }
 }
 #[rustfmt::skip]
+// the actual positiions of these vertices are not important. They aren't used
 const VERTICES: &[Vertex] = &[
     Vertex { position: [-1.0, -1.0] },
     Vertex { position: [ 1.0, -1.0] },
@@ -190,13 +191,8 @@ impl WindowState {
 
         let mandelbrot_min = Vec2::new(-2.0, -1.0);
         let mandelbrot_max = Vec2::new(1.0, 1.0);
-        let adjusted_transform = adjust_transform(
-            self.transform.inverse(),
-            Vec2::new(0., 0.),
-            viewport,
-            mandelbrot_min,
-            mandelbrot_max,
-        );
+        let viewport_to_mandelbrot =
+            general_transform(Vec2::new(0., 0.), viewport, mandelbrot_min, mandelbrot_max);
 
         // Calculate the aspect ratio of the Mandelbrot space
         let mandelbrot_aspect_ratio =
@@ -209,7 +205,8 @@ impl WindowState {
         )
         .inverse();
 
-        let final_transform = aspect_ratio_correction * adjusted_transform;
+        let final_transform =
+            aspect_ratio_correction * viewport_to_mandelbrot * self.transform.inverse();
 
         let uniforms = Globals {
             transform: transform_from_affine(final_transform),
